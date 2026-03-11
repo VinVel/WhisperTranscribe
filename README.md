@@ -120,6 +120,18 @@ Basic usage:
 uv run python .\main.py "C:\path\to\file.mp4"
 ```
 
+PowerShell wrapper:
+
+```powershell
+.\whispertransscribe.ps1 "C:\path\to\file.mp4"
+```
+
+The wrapper forwards all arguments to `main.py`, so this also works:
+
+```powershell
+.\whispertransscribe.ps1 "C:\path\to\file.mp4" --output-dir "C:\out" --language de
+```
+
 The output files are written next to the input file by default:
 
 - `file.srt`
