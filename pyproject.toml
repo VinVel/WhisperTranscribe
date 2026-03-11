@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "whispertransscribe"
 version = "0.1.0"
@@ -6,8 +10,13 @@ readme = "README.md"
 requires-python = ">=3.12.10"
 dependencies = [
     "faster-whisper>=1.2.1",
+    "huggingface-hub>=1.6.0",
     "pyannote-audio>=4.0.4",
 ]
+
+[project.scripts]
+whispertransscribe = "main:main"
+whispertransscribe-setup = "setup_models:main"
 
 [project.optional-dependencies]
 cpu = [
@@ -31,3 +40,9 @@ torch = [
 torchvision = [
   { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+
+[tool.uv]
+package = true
+
+[tool.setuptools]
+py-modules = ["main", "setup_models"]
