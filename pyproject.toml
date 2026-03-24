@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whispertransscribe"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small Python programm that makes use of Whisper in transscribing any audio or video file."
 readme = "README.md"
 requires-python = ">=3.12.10"
