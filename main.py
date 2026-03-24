@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import gc
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 import wave
 from dataclasses import dataclass
@@ -16,6 +19,7 @@ TARGET_SAMPLE_RATE = 16_000
 MIN_LANGUAGE_DETECTION_SECONDS = 0.8
 MERGE_GAP_SECONDS = 0.35
 MIN_OVERLAP_MARK_SECONDS = 0.2
+TIMER_MIN_MS = 10.0
 DEFAULT_WHISPER_MODEL_PATH = Path("models") / "faster-whisper-large-v3"
 DEFAULT_DIARIZATION_MODEL_PATH = Path("models") / "pyannote-speaker-diarization-community-1"
 
@@ -39,6 +43,37 @@ class TranscriptSegment:
 
 class TranscriptionError(RuntimeError):
     pass
+
+
+_TIMER_STACK: list[dict[str, float]] = []
+
+
+def timer(label: str | None = None, *, enabled: bool = True, min_ms: float = TIMER_MIN_MS):
+    def decorator(function):
+        if not enabled:
+            return function
+
+        timer_label = label or function.__name__
+
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            started_at = time.perf_counter()
+            frame = {"child_ms": 0.0}
+            _TIMER_STACK.append(frame)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                _TIMER_STACK.pop()
+                self_ms = max(0.0, elapsed_ms - frame["child_ms"])
+                if _TIMER_STACK:
+                    _TIMER_STACK[-1]["child_ms"] += elapsed_ms
+                if self_ms >= min_ms:
+                    print(f"[timer] {timer_label}: {self_ms / 1000:.2f}s")
+
+        return wrapper
+
+    return decorator
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +119,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    total_started_at = time.perf_counter()
     args = parse_args()
     media_path = args.media_path.expanduser().resolve()
     output_dir = (args.output_dir.expanduser().resolve() if args.output_dir else media_path.parent)
@@ -103,10 +139,14 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
+    finally:
+        total_elapsed_seconds = time.perf_counter() - total_started_at
+        print(f"[timer] total: {total_elapsed_seconds:.2f}s")
 
     return 0
 
 
+@timer()
 def run(
     media_path: Path,
     output_dir: Path,
@@ -147,28 +187,19 @@ def run(
         device = detect_device()
         compute_type = "float16" if device == "cuda" else "int8"
 
-        print(f"Loading faster-whisper model from {whisper_model_path} on {device}...")
-        whisper_model = load_whisper_model(
-            model_path=whisper_model_path,
-            device=device,
-            compute_type=compute_type,
-        )
-
-        print(f"Loading pyannote pipeline from {diarization_model_path} on {device}...")
-        diarization_pipeline = load_diarization_pipeline(
-            model_path=diarization_model_path,
+        speaker_turns, overlap_intervals = run_diarization_stage(
+            audio=audio,
+            diarization_model_path=diarization_model_path,
             device=device,
         )
-
-        print("Running speaker diarization...")
-        speaker_turns, overlap_intervals = diarize_audio(diarization_pipeline, audio)
         if not speaker_turns:
             raise TranscriptionError("Speaker diarization did not return any speech turns.")
 
-        print("Transcribing speaker turns...")
-        transcript_segments = transcribe_speaker_turns(
-            whisper_model=whisper_model,
+        transcript_segments = run_transcription_stage(
             audio=audio,
+            whisper_model_path=whisper_model_path,
+            device=device,
+            compute_type=compute_type,
             speaker_turns=speaker_turns,
             overlap_intervals=overlap_intervals,
             language_override=language,
@@ -179,6 +210,8 @@ def run(
         transcript_segments.sort(key=lambda segment: (segment.start, segment.end))
         write_outputs(media_path=media_path, output_dir=output_dir, transcript_segments=transcript_segments)
 
+
+@timer()
 def normalize_media(ffmpeg_path: str, media_path: Path, normalized_wav: Path) -> None:
     command = [
         ffmpeg_path,
@@ -204,6 +237,7 @@ def normalize_media(ffmpeg_path: str, media_path: Path, normalized_wav: Path) ->
         raise TranscriptionError(f"ffmpeg could not normalize the input media.\n{stderr}")
 
 
+@timer()
 def load_wav_mono_float32(wav_path: Path) -> Any:
     import numpy as np
 
@@ -233,6 +267,7 @@ def detect_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+@timer()
 def load_whisper_model(model_path: Path, device: str, compute_type: str) -> Any:
     from faster_whisper import WhisperModel
 
@@ -252,6 +287,7 @@ def is_valid_pyannote_model_dir(model_path: Path) -> bool:
     return model_path.is_dir() and (model_path / "config.yaml").is_file()
 
 
+@timer()
 def load_diarization_pipeline(model_path: Path, device: str) -> Any:
     import torch
 
@@ -281,13 +317,96 @@ def load_diarization_pipeline(model_path: Path, device: str) -> Any:
         ) from exc
 
 
+def configure_diarization_runtime(device: str) -> None:
+    import torch
+
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+
+def release_cuda_resources(device: str) -> None:
+    import torch
+
+    gc.collect()
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+
+
+@timer("run_diarization_stage")
+def run_diarization_stage(
+    audio: Any,
+    diarization_model_path: Path,
+    device: str,
+) -> tuple[list[SpeakerTurn], list[tuple[float, float]]]:
+    configure_diarization_runtime(device)
+    print(f"Loading pyannote pipeline from {diarization_model_path} on {device}...")
+    diarization_pipeline = load_diarization_pipeline(
+        model_path=diarization_model_path,
+        device=device,
+    )
+
+    try:
+        print("Running speaker diarization...")
+        return diarize_audio(diarization_pipeline, audio)
+    finally:
+        del diarization_pipeline
+        release_cuda_resources(device)
+
+
+@timer("run_transcription_stage")
+def run_transcription_stage(
+    audio: Any,
+    whisper_model_path: Path,
+    device: str,
+    compute_type: str,
+    speaker_turns: list[SpeakerTurn],
+    overlap_intervals: list[tuple[float, float]],
+    language_override: str | None,
+) -> list[TranscriptSegment]:
+    print(f"Loading faster-whisper model from {whisper_model_path} on {device}...")
+    whisper_model = load_whisper_model(
+        model_path=whisper_model_path,
+        device=device,
+        compute_type=compute_type,
+    )
+
+    try:
+        print("Transcribing speaker turns...")
+        return transcribe_speaker_turns(
+            whisper_model=whisper_model,
+            audio=audio,
+            speaker_turns=speaker_turns,
+            overlap_intervals=overlap_intervals,
+            language_override=language_override,
+        )
+    finally:
+        del whisper_model
+        release_cuda_resources(device)
+
+
+@timer()
 def diarize_audio(diarization_pipeline: Any, audio: Any) -> tuple[list[SpeakerTurn], list[tuple[float, float]]]:
     import torch
 
     waveform = torch.from_numpy(audio).unsqueeze(0)
 
     try:
-        diarization_output = diarization_pipeline({"waveform": waveform, "sample_rate": TARGET_SAMPLE_RATE})
+        with warnings.catch_warnings(), torch.inference_mode():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*TensorFloat-32 \(TF32\) has been disabled.*",
+                category=Warning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*degrees of freedom is <= 0.*",
+                category=UserWarning,
+            )
+            diarization_output = diarization_pipeline({"waveform": waveform, "sample_rate": TARGET_SAMPLE_RATE})
     except Exception as exc:
         raise TranscriptionError(f"Speaker diarization failed: {exc}") from exc
 
@@ -305,7 +424,14 @@ def diarize_audio(diarization_pipeline: Any, audio: Any) -> tuple[list[SpeakerTu
         turns.append(SpeakerTurn(start=float(segment.start), end=float(segment.end), speaker=str(speaker)))
 
     turns.sort(key=lambda turn: (turn.start, turn.end, turn.speaker))
-    return merge_adjacent_turns(turns), overlap_intervals
+    merged_turns = merge_adjacent_turns(turns)
+
+    del overlap_source
+    del diarization
+    del diarization_output
+    del waveform
+
+    return merged_turns, overlap_intervals
 
 
 def extract_overlap_intervals(diarization: Any) -> list[tuple[float, float]]:
@@ -366,6 +492,7 @@ def merge_adjacent_turns(turns: list[SpeakerTurn]) -> list[SpeakerTurn]:
     return merged
 
 
+@timer()
 def transcribe_speaker_turns(
     whisper_model: Any,
     audio: Any,
@@ -455,6 +582,7 @@ def slice_audio(audio: Any, start_seconds: float, end_seconds: float) -> Any:
     return audio[start_index:end_index]
 
 
+@timer()
 def write_outputs(media_path: Path, output_dir: Path, transcript_segments: list[TranscriptSegment]) -> None:
     srt_path = output_dir / f"{media_path.stem}.srt"
     txt_path = output_dir / f"{media_path.stem}.txt"
