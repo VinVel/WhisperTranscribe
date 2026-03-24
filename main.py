@@ -375,8 +375,8 @@ def run_transcription_stage(
     )
 
     try:
-        print("Transcribing speaker turns...")
-        return transcribe_speaker_turns(
+        print("Transcribing full audio...")
+        return transcribe_audio(
             whisper_model=whisper_model,
             audio=audio,
             speaker_turns=speaker_turns,
@@ -492,8 +492,25 @@ def merge_adjacent_turns(turns: list[SpeakerTurn]) -> list[SpeakerTurn]:
     return merged
 
 
+def pick_primary_speaker(
+    start_seconds: float,
+    end_seconds: float,
+    speaker_turns: list[SpeakerTurn],
+) -> str:
+    best_speaker = "UNKNOWN"
+    best_overlap = 0.0
+
+    for turn in speaker_turns:
+        overlap = min(end_seconds, turn.end) - max(start_seconds, turn.start)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speaker = turn.speaker
+
+    return best_speaker
+
+
 @timer()
-def transcribe_speaker_turns(
+def transcribe_audio(
     whisper_model: Any,
     audio: Any,
     speaker_turns: list[SpeakerTurn],
@@ -502,53 +519,49 @@ def transcribe_speaker_turns(
 ) -> list[TranscriptSegment]:
     transcript_segments: list[TranscriptSegment] = []
 
-    for turn in speaker_turns:
-        chunk = slice_audio(audio, turn.start, turn.end)
-        if len(chunk) == 0:
+    try:
+        segments, info = whisper_model.transcribe(
+            audio,
+            language=language_override,
+            multilingual=True,
+            vad_filter=True,
+            beam_size=5,
+            condition_on_previous_text=True,
+            hallucination_silence_threshold=1.5,
+        )
+    except Exception as exc:
+        raise TranscriptionError(f"Transcription failed: {exc}") from exc
+
+    default_language = language_override or getattr(info, "language", None) or "unknown"
+    for segment in segments:
+        text = segment.text.strip()
+        if not text:
             continue
 
-        turn_language = language_override or detect_language(whisper_model, chunk)
+        segment_start = float(segment.start)
+        segment_end = float(segment.end)
+        if segment_end <= segment_start:
+            continue
 
-        try:
-            segments, info = whisper_model.transcribe(
-                chunk,
-                language=turn_language,
-                multilingual=True,
-                vad_filter=True,
-                beam_size=5,
-                condition_on_previous_text=False,
+        segment_audio = slice_audio(audio, segment_start, segment_end)
+        segment_language = (
+            language_override
+            or detect_language(whisper_model, segment_audio)
+            or default_language
+            or "unknown"
+        )
+        speaker = pick_primary_speaker(segment_start, segment_end, speaker_turns)
+
+        transcript_segments.append(
+            TranscriptSegment(
+                start=segment_start,
+                end=segment_end,
+                speaker=speaker,
+                language=segment_language,
+                text=text,
+                simultaneous=intersects_overlap(segment_start, segment_end, overlap_intervals),
             )
-        except Exception as exc:
-            raise TranscriptionError(
-                f"Transcription failed for speaker turn {turn.speaker} at {turn.start:.2f}-{turn.end:.2f}s: {exc}"
-            ) from exc
-
-        default_language = language_override or getattr(info, "language", None) or turn_language or "unknown"
-        for segment in segments:
-            text = segment.text.strip()
-            if not text:
-                continue
-
-            absolute_start = turn.start + float(segment.start)
-            absolute_end = turn.start + float(segment.end)
-            segment_audio = slice_audio(audio, absolute_start, absolute_end)
-            segment_language = (
-                language_override
-                or detect_language(whisper_model, segment_audio)
-                or default_language
-                or "unknown"
-            )
-
-            transcript_segments.append(
-                TranscriptSegment(
-                    start=absolute_start,
-                    end=absolute_end,
-                    speaker=turn.speaker,
-                    language=segment_language,
-                    text=text,
-                    simultaneous=intersects_overlap(absolute_start, absolute_end, overlap_intervals),
-                )
-            )
+        )
 
     return transcript_segments
 
