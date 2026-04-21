@@ -452,7 +452,7 @@ def extract_overlap_intervals(diarization: Any) -> list[tuple[float, float]]:
     overlaps: list[tuple[float, float]] = []
     current_overlap_start: float | None = None
 
-    for time, delta, speaker in events:
+    for event_time, delta, speaker in events:
         was_overlapping = len(active_speakers) >= 2
 
         if delta < 0:
@@ -463,10 +463,10 @@ def extract_overlap_intervals(diarization: Any) -> list[tuple[float, float]]:
         is_overlapping = len(active_speakers) >= 2
 
         if not was_overlapping and is_overlapping:
-            current_overlap_start = time
+            current_overlap_start = event_time
         elif was_overlapping and not is_overlapping and current_overlap_start is not None:
-            if time - current_overlap_start >= MIN_OVERLAP_MARK_SECONDS:
-                overlaps.append((current_overlap_start, time))
+            if event_time - current_overlap_start >= MIN_OVERLAP_MARK_SECONDS:
+                overlaps.append((current_overlap_start, event_time))
             current_overlap_start = None
 
     return overlaps
