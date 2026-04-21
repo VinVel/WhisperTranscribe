@@ -46,3 +46,9 @@ package = true
 
 [tool.setuptools]
 py-modules = ["main", "setup_models"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.11",
+    "ty>=0.0.32",
+]
