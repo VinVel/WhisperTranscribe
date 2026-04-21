@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 from huggingface_hub import login, snapshot_download
 
@@ -237,7 +238,7 @@ def run_git(command: list[str]) -> None:
 
 
 def remove_tree(path: Path) -> None:
-    def onexc(function: object, target: str, excinfo: tuple[type[BaseException], BaseException, object]) -> None:
+    def onexc(function: Callable[..., Any], target: str, excinfo: BaseException) -> None:
         try:
             os.chmod(target, stat.S_IWRITE)
             function(target)
