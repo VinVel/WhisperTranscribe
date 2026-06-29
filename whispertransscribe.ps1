@@ -1,3 +1,5 @@
+#!/usr/bin/env pwsh
+
 [CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -11,7 +13,7 @@ $env:UV_CACHE_DIR = Join-Path $repoRoot ".uv-cache"
 
 Push-Location $repoRoot
 try {
-    & uv run .\main.py @Arguments
+    & uv run ./main.py @Arguments
     exit $LASTEXITCODE
 }
 finally {
